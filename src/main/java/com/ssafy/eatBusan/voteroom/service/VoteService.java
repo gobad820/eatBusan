@@ -12,6 +12,7 @@ import com.ssafy.eatBusan.voteroom.repository.VoteParticipantRepository;
 import com.ssafy.eatBusan.voteroom.repository.VoteRepository;
 import com.ssafy.eatBusan.voteroom.repository.VoteRoomRepository;
 import com.ssafy.eatBusan.voteroom.service.VoteRoomCacheService.CastResult;
+import com.ssafy.eatBusan.voteroom.service.VoteRoomCacheService.TallySnapshot;
 import java.util.List;
 import java.util.Optional;
 import lombok.RequiredArgsConstructor;
@@ -35,7 +36,10 @@ public class VoteService {
 
     @Transactional
     public VoteResponse cast(String publicId, Long memberId, Long candidateId) {
-        VoteRoom room = voteRoomRepository.findByPublicIdAndDeletedFalse(publicId)
+        // close()와 같은 방 행 잠금을 공유한다. 잠금이 커밋까지 유지되므로
+        // "isClosed 검사 통과 → 호스트가 마감 커밋 → CLOSED 방에 표 커밋" 인터리빙이 차단되고,
+        // close 커밋 후 시작한 cast는 여기서 CLOSED를 보고 409로 거부된다.
+        VoteRoom room = voteRoomRepository.findWithLockByPublicIdAndDeletedFalse(publicId)
             .orElseThrow(() -> new EBException(ErrorCode.VOTE_ROOM_NOT_FOUND));
         if (room.isClosed()) {
             throw new EBException(ErrorCode.VOTE_ROOM_CLOSED);
@@ -57,7 +61,6 @@ public class VoteService {
             voteRoomCacheService.ensureBootstrap(publicId, room.getId());
 
             // Redis Lua script로 "이전 표 차감 + 새 표 +1"을 원자적으로 먼저 처리한다.
-            // changed=false면 같은 후보 재클릭(멱등)이라 Redis도 DB도 바꿀 게 없다.
             result = voteRoomCacheService.cast(publicId, memberId, candidateId);
         } catch (RedisConnectionFailureException e) {
             log.warn("Redis unavailable, using DB fallback. publicId={} memberId={}",
@@ -67,12 +70,15 @@ public class VoteService {
 
         // Redis는 이미 바뀐 상태이므로, DB 동기화 실패 시 Redis를 되돌린 뒤 예외를 다시 던진다.
         // 예외를 삼키고 성공 응답을 주면 클라이언트와 DB/Redis 상태가 서로 어긋난다.
-        if (result.changed()) {
-            try {
-                syncToDb(room.getId(), memberId, candidateId);
-            } catch (Exception e) {
-                log.warn("DB sync failed, compensating Redis. publicId={} memberId={}",
-                    publicId, memberId, e);
+        // changed=false(같은 후보 재클릭)여도 sync는 수행한다 — 정상 경로에서는 no-op이지만,
+        // fallback 기간에 생긴 "Redis choice ≠ DB vote" 불일치가 응답과 DB의 모순으로 굳는 것을 막는다.
+        try {
+            syncToDb(room.getId(), memberId, candidateId);
+        } catch (Exception e) {
+            log.warn("DB sync failed, compensating Redis. publicId={} memberId={}",
+                publicId, memberId, e);
+            // changed=false면 Redis가 안 바뀐 것이므로 되돌릴 것도 없다.
+            if (result.changed()) {
                 try {
                     voteRoomCacheService.compensate(publicId, memberId,
                         result.prevCandidateId(), candidateId);
@@ -81,19 +87,19 @@ public class VoteService {
                     log.error("Redis compensation failed. publicId={} memberId={}",
                         publicId, memberId, compensationException);
                 }
-                throw e;
             }
+            throw e;
         }
 
-        List<TallyEntry> tally = voteRoomCacheService.getTally(publicId, room.getId());
+        TallySnapshot snapshot = voteRoomCacheService.getTally(publicId, room.getId());
 
         // 집계가 실제로 바뀐 경우에만 커밋 후 broadcast를 예약한다.
         // 같은 후보 재클릭(changed=false)은 push할 변화 자체가 없다 (멱등).
         if (result.changed()) {
-            voteRoomBroadcaster.broadcastTallyUpdated(publicId, tally);
+            voteRoomBroadcaster.broadcastTallyUpdated(publicId, snapshot);
         }
 
-        return new VoteResponse(candidateId, tally);
+        return new VoteResponse(candidateId, snapshot.entries());
     }
 
     private void syncToDb(Long roomId, Long memberId, Long candidateId) {
@@ -116,12 +122,18 @@ public class VoteService {
 
     // Redis 다운 시 DB만으로 투표를 처리하고 DB 기준 집계를 돌려준다.
     private VoteResponse fallbackToDb(VoteRoom room, Long memberId, Long candidateId) {
+        // fallback 기간의 표는 Redis tally/choice에 반영되지 못한다.
+        // best-effort로 initKey를 무효화해 두면 부분 복구 시 즉시,
+        // 아니어도 initKey TTL 만료 시 bootstrap이 DB 기준으로 재적재해 수렴한다.
+        voteRoomCacheService.tryInvalidateBootstrap(room.getPublicId());
+
         syncToDb(room.getId(), memberId, candidateId);
         List<TallyEntry> tally = voteRoomCacheService.tallyFromDb(room.getId());
 
-        // fallback 경로도 DB 상태는 바뀌었으므로 커밋 후 broadcast한다.
+        // fallback 경로도 DB 상태는 바뀌었으므로 커밋 후 broadcast한다. 버전은 미상(UNVERSIONED).
         // (같은 후보 재클릭 판별이 없어 드물게 불변 push가 갈 수 있으나, 화면은 같은 집계로 갱신될 뿐이다.)
-        voteRoomBroadcaster.broadcastTallyUpdated(room.getPublicId(), tally);
+        voteRoomBroadcaster.broadcastTallyUpdated(room.getPublicId(),
+            new TallySnapshot(VoteRoomCacheService.UNVERSIONED, tally));
 
         return new VoteResponse(candidateId, tally);
     }

@@ -18,6 +18,7 @@ import com.ssafy.eatBusan.voteroom.dto.VoteRoomResultResponse;
 import com.ssafy.eatBusan.voteroom.repository.VoteCandidateRepository;
 import com.ssafy.eatBusan.voteroom.repository.VoteParticipantRepository;
 import com.ssafy.eatBusan.voteroom.repository.VoteRoomRepository;
+import com.ssafy.eatBusan.voteroom.service.VoteRoomCacheService.TallySnapshot;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -96,7 +97,7 @@ public class VoteRoomService {
             .findByRoomIdAndMemberIdAndDeletedFalse(room.getId(), memberId)
             .orElseThrow(() -> new EBException(ErrorCode.NOT_ROOM_PARTICIPANT));
 
-        // 방 상세 조회 = 입장으로 간주한다 (WebSocket 구독 도입 전까지의 JOINED 전환 지점).
+        // 방 상세 조회 = 입장으로 간주한다 (STOMP 구독 시점의 joinOnSubscribe와 함께 JOINED 전환 지점).
         me.join();
 
         List<VoteCandidate> candidates = voteCandidateRepository.findAllByRoomIdAndDeletedFalse(room.getId());
@@ -119,30 +120,48 @@ public class VoteRoomService {
         VoteRoom room = findRoom(publicId);
         validateParticipant(room.getId(), memberId);
 
-        List<TallyEntry> tally = voteRoomCacheService.getTally(publicId, room.getId());
-        return new VoteRoomResultResponse(room.getStatus().name(), room.getWinnerCandidateId(), tally);
+        TallySnapshot snapshot = voteRoomCacheService.getTally(publicId, room.getId());
+        return new VoteRoomResultResponse(room.getStatus().name(), room.getWinnerCandidateId(),
+            snapshot.version(), snapshot.entries());
+    }
+
+    // STOMP SUBSCRIBE 시점의 인가 + 입장 처리 (설계 §4.2: 방 입장/구독 = JOINED 전환 트리거).
+    // ChannelInterceptor는 트랜잭션 밖에서 동작하므로, 참가자 상태 변경은 이 @Transactional 메서드를 거쳐야 한다.
+    @Transactional
+    public void joinOnSubscribe(String publicId, Long memberId) {
+        VoteRoom room = findRoom(publicId);
+        VoteParticipant me = voteParticipantRepository
+            .findByRoomIdAndMemberIdAndDeletedFalse(room.getId(), memberId)
+            .orElseThrow(() -> new EBException(ErrorCode.NOT_ROOM_PARTICIPANT));
+        me.join();
     }
 
     @Transactional
     public VoteRoomResultResponse close(String publicId, Long memberId) {
-        VoteRoom room = findRoom(publicId);
+        // cast()와 같은 방 행 잠금을 공유한다.
+        // - 진행 중인 cast가 커밋된 뒤에야 tally를 스냅샷하므로 winner와 최종 집계가 어긋나지 않는다.
+        // - 동시 close 이중 호출도 직렬화되어, 늦은 쪽은 아래 멱등 분기로 빠진다 (winner 덮어쓰기/이중 push 차단).
+        VoteRoom room = voteRoomRepository.findWithLockByPublicIdAndDeletedFalse(publicId)
+            .orElseThrow(() -> new EBException(ErrorCode.VOTE_ROOM_NOT_FOUND));
         if (!room.isHost(memberId)) {
             throw new EBException(ErrorCode.NOT_ROOM_HOST);
         }
 
         // 멱등: 이미 CLOSED면 기존 winner 그대로 반환 (재계산·재push 없음)
         if (room.isClosed()) {
+            TallySnapshot snapshot = voteRoomCacheService.getTally(publicId, room.getId());
             return new VoteRoomResultResponse(room.getStatus().name(), room.getWinnerCandidateId(),
-                voteRoomCacheService.getTally(publicId, room.getId()));
+                snapshot.version(), snapshot.entries());
         }
 
-        List<TallyEntry> tally = voteRoomCacheService.getTally(publicId, room.getId());
-        room.close(decideWinner(tally));
+        TallySnapshot snapshot = voteRoomCacheService.getTally(publicId, room.getId());
+        room.close(decideWinner(snapshot.entries()));
 
         // 실제 OPEN -> CLOSED 전환 시에만 커밋 후 broadcast — 멱등 경로(위 early return)는 재push 금지.
-        voteRoomBroadcaster.broadcastRoomClosed(publicId, room.getWinnerCandidateId(), tally);
+        voteRoomBroadcaster.broadcastRoomClosed(publicId, room.getWinnerCandidateId(), snapshot);
 
-        return new VoteRoomResultResponse(room.getStatus().name(), room.getWinnerCandidateId(), tally);
+        return new VoteRoomResultResponse(room.getStatus().name(), room.getWinnerCandidateId(),
+            snapshot.version(), snapshot.entries());
     }
 
     // D2: 최다득표, 동점이면 최소 candidateId 승리 (완전 결정론)

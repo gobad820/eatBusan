@@ -32,4 +32,20 @@ public class RedisConfig {
         return redisScript;
     }
 
+    @Bean
+    public DefaultRedisScript<Long> voteCompensateScript(){
+        DefaultRedisScript<Long> redisScript = new DefaultRedisScript<>();
+        redisScript.setLocation(new ClassPathResource("scripts/vote-compensate.lua"));
+        redisScript.setResultType(Long.class);
+        return redisScript;
+    }
+
+    @Bean
+    public DefaultRedisScript<List> voteTallyScript(){
+        DefaultRedisScript<List> redisScript = new DefaultRedisScript<>();
+        redisScript.setLocation(new ClassPathResource("scripts/vote-tally.lua"));
+        redisScript.setResultType(List.class);
+        return redisScript;
+    }
+
 }

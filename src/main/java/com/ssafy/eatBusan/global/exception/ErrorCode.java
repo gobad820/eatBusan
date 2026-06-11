@@ -53,7 +53,8 @@ public enum ErrorCode {
     VOTE_ROOM_CLOSED(HttpStatus.CONFLICT, "이미 마감된 투표방입니다."),
     NOT_ROOM_PARTICIPANT(HttpStatus.FORBIDDEN, "투표방 참가자가 아닙니다."),
     NOT_ROOM_HOST(HttpStatus.FORBIDDEN, "투표방 호스트만 수행할 수 있습니다."),
-    CANDIDATE_NOT_IN_ROOM(HttpStatus.BAD_REQUEST, "이 투표방의 후보가 아닙니다.");
+    CANDIDATE_NOT_IN_ROOM(HttpStatus.BAD_REQUEST, "이 투표방의 후보가 아닙니다."),
+    WS_SEND_NOT_ALLOWED(HttpStatus.FORBIDDEN, "WebSocket으로는 메시지를 보낼 수 없습니다.");
 
     private final HttpStatus status;
     private final String message;
