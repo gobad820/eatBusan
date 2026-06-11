@@ -5,12 +5,14 @@ import com.ssafy.eatBusan.global.exception.ErrorCode;
 import com.ssafy.eatBusan.voteroom.domain.Vote;
 import com.ssafy.eatBusan.voteroom.domain.VoteParticipant;
 import com.ssafy.eatBusan.voteroom.domain.VoteRoom;
+import com.ssafy.eatBusan.voteroom.dto.TallyEntry;
 import com.ssafy.eatBusan.voteroom.dto.VoteResponse;
 import com.ssafy.eatBusan.voteroom.repository.VoteCandidateRepository;
 import com.ssafy.eatBusan.voteroom.repository.VoteParticipantRepository;
 import com.ssafy.eatBusan.voteroom.repository.VoteRepository;
 import com.ssafy.eatBusan.voteroom.repository.VoteRoomRepository;
 import com.ssafy.eatBusan.voteroom.service.VoteRoomCacheService.CastResult;
+import java.util.List;
 import java.util.Optional;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -25,6 +27,7 @@ import org.springframework.transaction.annotation.Transactional;
 public class VoteService {
 
     private final VoteRoomCacheService voteRoomCacheService;
+    private final VoteRoomBroadcaster voteRoomBroadcaster;
     private final VoteRoomRepository voteRoomRepository;
     private final VoteParticipantRepository voteParticipantRepository;
     private final VoteCandidateRepository voteCandidateRepository;
@@ -82,7 +85,15 @@ public class VoteService {
             }
         }
 
-        return new VoteResponse(candidateId, voteRoomCacheService.getTally(publicId, room.getId()));
+        List<TallyEntry> tally = voteRoomCacheService.getTally(publicId, room.getId());
+
+        // 집계가 실제로 바뀐 경우에만 커밋 후 broadcast를 예약한다.
+        // 같은 후보 재클릭(changed=false)은 push할 변화 자체가 없다 (멱등).
+        if (result.changed()) {
+            voteRoomBroadcaster.broadcastTallyUpdated(publicId, tally);
+        }
+
+        return new VoteResponse(candidateId, tally);
     }
 
     private void syncToDb(Long roomId, Long memberId, Long candidateId) {
@@ -106,6 +117,12 @@ public class VoteService {
     // Redis 다운 시 DB만으로 투표를 처리하고 DB 기준 집계를 돌려준다.
     private VoteResponse fallbackToDb(VoteRoom room, Long memberId, Long candidateId) {
         syncToDb(room.getId(), memberId, candidateId);
-        return new VoteResponse(candidateId, voteRoomCacheService.tallyFromDb(room.getId()));
+        List<TallyEntry> tally = voteRoomCacheService.tallyFromDb(room.getId());
+
+        // fallback 경로도 DB 상태는 바뀌었으므로 커밋 후 broadcast한다.
+        // (같은 후보 재클릭 판별이 없어 드물게 불변 push가 갈 수 있으나, 화면은 같은 집계로 갱신될 뿐이다.)
+        voteRoomBroadcaster.broadcastTallyUpdated(room.getPublicId(), tally);
+
+        return new VoteResponse(candidateId, tally);
     }
 }

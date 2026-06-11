@@ -40,6 +40,7 @@ public class VoteRoomService {
     private final VoteParticipantRepository voteParticipantRepository;
     private final VoteCandidateRepository voteCandidateRepository;
     private final VoteRoomCacheService voteRoomCacheService;
+    private final VoteRoomBroadcaster voteRoomBroadcaster;
     private final PlaceService placeService;
 
     @Transactional
@@ -137,6 +138,9 @@ public class VoteRoomService {
 
         List<TallyEntry> tally = voteRoomCacheService.getTally(publicId, room.getId());
         room.close(decideWinner(tally));
+
+        // 실제 OPEN -> CLOSED 전환 시에만 커밋 후 broadcast — 멱등 경로(위 early return)는 재push 금지.
+        voteRoomBroadcaster.broadcastRoomClosed(publicId, room.getWinnerCandidateId(), tally);
 
         return new VoteRoomResultResponse(room.getStatus().name(), room.getWinnerCandidateId(), tally);
     }
