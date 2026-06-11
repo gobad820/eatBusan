@@ -24,5 +24,12 @@ public class RedisConfig {
         return redisScript;
     }
 
+    @Bean
+    public DefaultRedisScript<List> voteCastScript(){
+        DefaultRedisScript<List> redisScript = new DefaultRedisScript<>();
+        redisScript.setLocation(new ClassPathResource("scripts/vote-cast.lua"));
+        redisScript.setResultType(List.class);
+        return redisScript;
+    }
 
 }
