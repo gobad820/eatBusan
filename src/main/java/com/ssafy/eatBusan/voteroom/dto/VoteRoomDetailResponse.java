@@ -8,7 +8,9 @@ public record VoteRoomDetailResponse(
         Long hostMemberId,
         String status,
         Long winnerCandidateId,
-        Long myCandidateId,
+        String inviteCode,
+        boolean amHost,
+        List<Long> myBallot,
         List<CandidateResponse> candidates,
         List<ParticipantResponse> participants
 ) {

@@ -13,8 +13,11 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.redis.RedisConnectionFailureException;
+import org.springframework.data.redis.core.Cursor;
+import org.springframework.data.redis.core.ScanOptions;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
@@ -38,8 +41,9 @@ public class VoteRoomCacheService {
     private final DefaultRedisScript<Long> voteCompensateScript;
     private final DefaultRedisScript<List> voteTallyScript;
 
-    // cast Lua의 결과. changed=false면 같은 후보 재클릭(멱등)이라 Redis가 안 바뀐 것이다.
-    public record CastResult(boolean changed, Long prevCandidateId) {
+    // cast Lua의 결과. changed=false면 같은 ballot 재제출(멱등)이라 Redis가 안 바뀐 것이다.
+    // prevBallot = cast 직전의 ballot 콤마조인 문자열(첫 투표면 ""). compensate에 그대로 넘긴다.
+    public record CastResult(boolean changed, String prevBallot) {
     }
 
     // 집계 스냅샷 + 방별 단조 증가 버전. broadcast 순서가 커밋 순서와 어긋나도
@@ -47,8 +51,8 @@ public class VoteRoomCacheService {
     public record TallySnapshot(long version, List<TallyEntry> entries) {
     }
 
-    // 방 생성 직후 모든 후보를 0표로 적재한다.
-    // ZSET은 ZINCRBY되지 않은 멤버를 갖지 않으므로, 0으로 미리 ZADD해야 0표 후보도 집계에 나타난다.
+    // 방 생성 직후 모든 후보를 0점으로 적재한다.
+    // ZSET은 ZINCRBY되지 않은 멤버를 갖지 않으므로, 0으로 미리 ZADD해야 0점 후보도 집계에 나타난다.
     public void seed(String publicId, List<Long> candidateIds) {
         redisTemplate.delete(tallyKey(publicId));
         for (Long candidateId : candidateIds) {
@@ -81,20 +85,32 @@ public class VoteRoomCacheService {
             // DB를 기준으로 다시 만들기 전에 tally 본체를 먼저 비운다.
             redisTemplate.delete(tallyKey(publicId));
 
-            // 1) 모든 후보를 0표로 적재 — 0표 후보 누락 방지
+            // 1) 모든 후보를 0점으로 적재 — 0점 후보 누락 방지
             List<VoteCandidate> candidates = voteCandidateRepository.findAllByRoomIdAndDeletedFalse(roomId);
             for (VoteCandidate candidate : candidates) {
                 redisTemplate.opsForZSet()
                     .add(tallyKey(publicId), String.valueOf(candidate.getId()), 0);
             }
 
-            // 2) DB에 저장된 표를 반영 — tally 증분 + 각자의 choice 키 복원
+            // 2) DB에 저장된 표를 반영 — 멤버별로 ballot을 그룹핑해
+            //    각 후보에 점수(pointsOf) 가산 + ballotKey 복원.
             List<Vote> votes = voteRepository.findAllByRoomIdAndDeletedFalse(roomId);
-            for (Vote vote : votes) {
-                redisTemplate.opsForZSet()
-                    .incrementScore(tallyKey(publicId), String.valueOf(vote.getCandidateId()), 1);
+            Map<Long, List<Vote>> byMember = votes.stream()
+                .collect(Collectors.groupingBy(Vote::getMemberId));
+            for (Map.Entry<Long, List<Vote>> entry : byMember.entrySet()) {
+                // rank 오름차순으로 정렬해 ballot 순서를 복원한다.
+                List<Vote> ballot = new ArrayList<>(entry.getValue());
+                ballot.sort(Comparator.comparingInt(Vote::getRank));
+                List<String> candidateStrs = new ArrayList<>();
+                for (Vote vote : ballot) {
+                    redisTemplate.opsForZSet().incrementScore(
+                        tallyKey(publicId),
+                        String.valueOf(vote.getCandidateId()),
+                        Vote.pointsOf(vote.getRank()));
+                    candidateStrs.add(String.valueOf(vote.getCandidateId()));
+                }
                 redisTemplate.opsForValue()
-                    .set(choiceKey(publicId, vote.getMemberId()), String.valueOf(vote.getCandidateId()));
+                    .set(ballotKey(publicId, entry.getKey()), String.join(",", candidateStrs));
             }
 
             // 표가 0개여도 bootstrap 완료 상태는 표시해야 한다. (TTL — 위 상수 주석 참고)
@@ -106,29 +122,30 @@ public class VoteRoomCacheService {
         }
     }
 
-    // Lua로 "이전 표 차감 + 새 표 +1 + 내 선택 갱신"을 원자 처리한다 (1인 1표).
-    public CastResult cast(String publicId, Long memberId, Long candidateId) {
+    // Lua로 "이전 ballot 점수 차감 + 새 ballot 점수 가산 + 내 ballot 갱신"을 원자 처리한다.
+    public CastResult cast(String publicId, Long memberId, List<Long> ballot) {
+        String[] argv = ballot.stream().map(String::valueOf).toArray(String[]::new);
         List<?> result = redisTemplate.execute(
             voteCastScript,
-            List.of(tallyKey(publicId), choiceKey(publicId, memberId), versionKey(publicId)),
-            String.valueOf(candidateId)
+            List.of(tallyKey(publicId), ballotKey(publicId, memberId), versionKey(publicId)),
+            (Object[]) argv
         );
         boolean changed = ((Number) result.get(0)).longValue() == 1L;
-        String prevRaw = result.size() > 1 && result.get(1) != null ? result.get(1).toString() : "";
-        Long prevCandidateId = prevRaw.isEmpty() ? null : Long.valueOf(prevRaw);
-        return new CastResult(changed, prevCandidateId);
+        String prevBallot = result.size() > 1 && result.get(1) != null ? result.get(1).toString() : "";
+        return new CastResult(changed, prevBallot);
     }
 
     // DB sync 실패 시 cast로 이미 바뀐 Redis를 이전 상태로 되돌린다.
-    // cast Lua의 정확한 역연산은 "choice가 아직 내 newCandidateId일 때"만 성립한다 —
-    // 그 사이 다른 요청이 choice를 바꿨다면 내 증분은 이미 차감된 것이라 되돌리면 안 된다.
-    // 조건 검사와 되돌림을 Lua로 원자 처리해 이중 차감(음수 score/유령 표)을 막는다.
-    public void compensate(String publicId, Long memberId, Long prevCandidateId, Long newCandidateId) {
+    // cast Lua의 정확한 역연산은 "ballotKey가 아직 내 newBallot일 때"만 성립한다 —
+    // 그 사이 다른 cast가 ballot을 덮었다면 내 증분은 이미 정리된 것이라 되돌리면 안 된다.
+    // 조건 검사와 되돌림을 Lua로 원자 처리해 이중 차감(음수 score/유령 점수)을 막는다.
+    public void compensate(String publicId, Long memberId, String prevBallot, List<Long> newBallot) {
+        String newBallotStr = newBallot.stream().map(String::valueOf).collect(Collectors.joining(","));
         redisTemplate.execute(
             voteCompensateScript,
-            List.of(tallyKey(publicId), choiceKey(publicId, memberId), versionKey(publicId)),
-            String.valueOf(newCandidateId),
-            prevCandidateId != null ? String.valueOf(prevCandidateId) : ""
+            List.of(tallyKey(publicId), ballotKey(publicId, memberId), versionKey(publicId)),
+            newBallotStr,
+            prevBallot != null ? prevBallot : ""
         );
     }
 
@@ -142,7 +159,7 @@ public class VoteRoomCacheService {
         }
     }
 
-    // 현재 집계를 표수 내림차순으로, 방 버전과 함께 원자적으로 스냅샷한다. Redis 다운 시 DB로 fallback.
+    // 현재 집계를 점수 내림차순으로, 방 버전과 함께 원자적으로 스냅샷한다. Redis 다운 시 DB로 fallback.
     public TallySnapshot getTally(String publicId, Long roomId) {
         try {
             ensureBootstrap(publicId, roomId);
@@ -169,39 +186,79 @@ public class VoteRoomCacheService {
         }
     }
 
-    // 내가 현재 찍은 후보. 아직 안 찍었으면 null. Redis 다운 시 DB로 fallback.
-    public Long getMyChoice(String publicId, Long roomId, Long memberId) {
+    // version을 INCR한 뒤 getTally로 "증가된 version + 집계"를 스냅샷한다. close의 OPEN->CLOSED 전환에서만 쓴다.
+    // 효과: ROOM_CLOSED가 직전 TALLY_UPDATED보다 큰 version을 실어 클라이언트의 단조증가 dedup을 통과한다.
+    // 경쟁 안전: close는 방 행 락 안에서 호출되고 마감 후 cast가 거부되므로, INCR과 getTally(읽기) 사이에
+    // tally를 바꾸는 cast가 끼어들 수 없다. 따라서 "증가된 version + 그 시점 집계" 쌍이 일관된다.
+    // Redis 연결 장애로 INCR가 실패하면 삼키고 getTally로 진행한다(getTally가 DB fallback + UNVERSIONED 처리).
+    // 즉 어떤 경우에도 스냅샷은 반환된다.
+    public TallySnapshot bumpVersionAndGetTally(String publicId, Long roomId) {
+        try {
+            redisTemplate.opsForValue().increment(versionKey(publicId));
+        } catch (RedisConnectionFailureException e) {
+            // 장애 시 INCR는 포기하고 getTally의 DB fallback에 맡긴다.
+        }
+        return getTally(publicId, roomId);
+    }
+
+    // 내가 현재 제출한 ballot(후보 candidateId 리스트, rank 순서). 아직 안 찍었으면 빈 리스트. Redis 다운 시 DB로 fallback.
+    public List<Long> getMyBallot(String publicId, Long roomId, Long memberId) {
         try {
             ensureBootstrap(publicId, roomId);
-            String value = redisTemplate.opsForValue().get(choiceKey(publicId, memberId));
-            return value != null ? Long.valueOf(value) : null;
+            String value = redisTemplate.opsForValue().get(ballotKey(publicId, memberId));
+            if (value == null || value.isEmpty()) {
+                return List.of();
+            }
+            List<Long> ballot = new ArrayList<>();
+            for (String s : value.split(",")) {
+                ballot.add(Long.valueOf(s));
+            }
+            return ballot;
         } catch (RedisConnectionFailureException e) {
-            return voteRepository.findByRoomIdAndMemberIdAndDeletedFalse(roomId, memberId)
+            return voteRepository.findAllByRoomIdAndMemberIdAndDeletedFalseOrderByRankAsc(roomId, memberId).stream()
                 .map(Vote::getCandidateId)
-                .orElse(null);
+                .toList();
         }
     }
 
-    // DB 기준 집계. GROUP BY 결과에 없는 0표 후보를 0으로 채워서 반환한다.
+    // DB 기준 집계. 후보별 Vote.pointsOf 합산, GROUP BY 결과에 없는 0점 후보를 0으로 채워서
+    // 점수 내림차순 + candidateId 오름차순으로 반환한다.
     public List<TallyEntry> tallyFromDb(Long roomId) {
-        Map<Long, Long> counts = new HashMap<>();
-        for (TallyEntry entry : voteRepository.countTallyByRoomId(roomId)) {
-            counts.put(entry.candidateId(), entry.count());
+        Map<Long, Long> scores = new HashMap<>();
+        for (Vote vote : voteRepository.findAllByRoomIdAndDeletedFalse(roomId)) {
+            scores.merge(vote.getCandidateId(), (long) Vote.pointsOf(vote.getRank()), Long::sum);
         }
         return voteCandidateRepository.findAllByRoomIdAndDeletedFalse(roomId).stream()
             .map(candidate -> new TallyEntry(
-                candidate.getId(), counts.getOrDefault(candidate.getId(), 0L)))
-            .sorted(Comparator.comparing(TallyEntry::count).reversed()
+                candidate.getId(), scores.getOrDefault(candidate.getId(), 0L)))
+            .sorted(Comparator.comparing(TallyEntry::score).reversed()
                 .thenComparing(TallyEntry::candidateId))
             .toList();
+    }
+
+    // 방 단발성 hard delete용. tally/ver/init/lock + ballot:* 키 전부 삭제.
+    public void purge(String publicId) {
+        redisTemplate.delete(List.of(
+            tallyKey(publicId), versionKey(publicId), initKey(publicId), lockKey(publicId)));
+        List<String> ballotKeys = new ArrayList<>();
+        ScanOptions options = ScanOptions.scanOptions()
+            .match("voteroom:" + publicId + ":ballot:*").count(100).build();
+        try (Cursor<String> cursor = redisTemplate.scan(options)) {
+            while (cursor.hasNext()) {
+                ballotKeys.add(cursor.next());
+            }
+        }
+        if (!ballotKeys.isEmpty()) {
+            redisTemplate.delete(ballotKeys);
+        }
     }
 
     private String tallyKey(String publicId) {
         return "voteroom:" + publicId + ":tally";
     }
 
-    private String choiceKey(String publicId, Long memberId) {
-        return "voteroom:" + publicId + ":choice:" + memberId;
+    private String ballotKey(String publicId, Long memberId) {
+        return "voteroom:" + publicId + ":ballot:" + memberId;
     }
 
     private String versionKey(String publicId) {

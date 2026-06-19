@@ -1,4 +1,4 @@
-local tallyKey = KEYS[1]   -- voteroom:{publicId}:tally
+local tallyKey = KEYS[1]   -- voteroom:{publicId}:tally (ZSET score=순위 ballot 점수합)
 local verKey   = KEYS[2]   -- voteroom:{publicId}:ver
 
 -- 버전과 집계를 한 번에(원자적으로) 스냅샷한다.

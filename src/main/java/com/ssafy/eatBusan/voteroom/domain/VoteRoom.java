@@ -10,6 +10,7 @@ import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
 import jakarta.persistence.UniqueConstraint;
+import java.time.LocalDateTime;
 import lombok.AccessLevel;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
@@ -17,7 +18,10 @@ import lombok.NoArgsConstructor;
 @Entity
 @Table(
         name = "vote_room",
-        uniqueConstraints = @UniqueConstraint(columnNames = {"public_id"})
+        uniqueConstraints = {
+                @UniqueConstraint(columnNames = {"public_id"}),
+                @UniqueConstraint(columnNames = {"invite_code"})
+        }
 )
 @Getter
 @NoArgsConstructor(access = AccessLevel.PROTECTED)
@@ -45,6 +49,14 @@ public class VoteRoom extends BaseEntity {
     @Column(name = "winner_candidate_id")
     private Long winnerCandidateId;
 
+    // 코드 입장용 초대 코드. 6자리 대문자+숫자(혼동문자 제외), 전역 unique.
+    @Column(name = "invite_code", nullable = false, length = 6)
+    private String inviteCode;
+
+    // 마감 시각. OPEN 동안은 null이다. 단발성 hard delete 스케줄러의 기준 시각.
+    @Column(name = "closed_at")
+    private LocalDateTime closedAt;
+
     // 방 생성 시점의 후보 시드 조건(호스트 위치 기반) 스냅샷
     @Column(name = "seed_lat", nullable = false)
     private Double seedLat;
@@ -56,11 +68,12 @@ public class VoteRoom extends BaseEntity {
     private Integer seedRadius;
 
     public static VoteRoom of(String publicId, String title, Long hostMemberId,
-            Double seedLat, Double seedLng, Integer seedRadius) {
+            String inviteCode, Double seedLat, Double seedLng, Integer seedRadius) {
         VoteRoom voteRoom = new VoteRoom();
         voteRoom.publicId = publicId;
         voteRoom.title = title;
         voteRoom.hostMemberId = hostMemberId;
+        voteRoom.inviteCode = inviteCode;
         voteRoom.status = VoteRoomStatus.OPEN;
         voteRoom.seedLat = seedLat;
         voteRoom.seedLng = seedLng;
@@ -79,5 +92,6 @@ public class VoteRoom extends BaseEntity {
     public void close(Long winnerCandidateId) {
         this.status = VoteRoomStatus.CLOSED;
         this.winnerCandidateId = winnerCandidateId;
+        this.closedAt = LocalDateTime.now();
     }
 }

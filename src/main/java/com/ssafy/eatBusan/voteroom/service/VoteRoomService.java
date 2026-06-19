@@ -19,6 +19,7 @@ import com.ssafy.eatBusan.voteroom.repository.VoteCandidateRepository;
 import com.ssafy.eatBusan.voteroom.repository.VoteParticipantRepository;
 import com.ssafy.eatBusan.voteroom.repository.VoteRoomRepository;
 import com.ssafy.eatBusan.voteroom.service.VoteRoomCacheService.TallySnapshot;
+import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -37,6 +38,11 @@ public class VoteRoomService {
     // D1: searchPlace 결과 앞 5개를 후보로 시드한다 (거리순 무보장 — 기존 메서드 재사용 우선).
     private static final int CANDIDATE_SEED_SIZE = 5;
 
+    // 초대 코드: 6자리, 대문자+숫자에서 혼동문자(0,O,1,I,L) 제외한 알파벳 풀.
+    private static final int INVITE_CODE_LENGTH = 6;
+    private static final String INVITE_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+    private static final SecureRandom INVITE_CODE_RANDOM = new SecureRandom();
+
     private final VoteRoomRepository voteRoomRepository;
     private final VoteParticipantRepository voteParticipantRepository;
     private final VoteCandidateRepository voteCandidateRepository;
@@ -54,7 +60,7 @@ public class VoteRoomService {
         }
 
         VoteRoom room = voteRoomRepository.save(VoteRoom.of(
-            generatePublicId(), request.title(), hostMemberId,
+            generatePublicId(), request.title(), hostMemberId, generateInviteCode(),
             request.lat(), request.lng(), request.radius()));
 
         // 후보 시드: 검색 결과 앞 N개의 placeId/placeName 스냅샷
@@ -64,18 +70,12 @@ public class VoteRoomService {
                 .map(place -> VoteCandidate.of(room.getId(), place.id(), place.name(), hostMemberId))
                 .toList());
 
-        // 호스트도 참가자(JOINED)로 등록해야 투표·조회 인가를 통과할 수 있다.
+        // 초대 코드 입장 방식이므로, 생성 시점엔 호스트만 참가자(JOINED)로 등록한다.
         List<VoteParticipant> participants = new ArrayList<>();
         participants.add(VoteParticipant.joined(room.getId(), hostMemberId));
-        if (request.invitedMemberIds() != null) {
-            request.invitedMemberIds().stream()
-                .distinct()
-                .filter(memberId -> !memberId.equals(hostMemberId))
-                .forEach(memberId -> participants.add(VoteParticipant.invited(room.getId(), memberId)));
-        }
         voteParticipantRepository.saveAll(participants);
 
-        // Redis tally를 모든 후보 0표로 즉시 시드한다.
+        // Redis tally를 모든 후보 0점으로 즉시 시드한다.
         // 실패해도 ensureBootstrap이 나중에 DB 기준으로 복구하므로 방 생성 자체는 성공시킨다.
         try {
             voteRoomCacheService.seed(room.getPublicId(),
@@ -86,8 +86,28 @@ public class VoteRoomService {
 
         return new VoteRoomCreateResponse(
             room.getPublicId(),
+            room.getInviteCode(),
             candidates.stream().map(CandidateResponse::from).toList(),
             participants.stream().map(ParticipantResponse::from).toList());
+    }
+
+    // 코드 입장: OPEN 방을 초대 코드로 찾아 호출자를 JOINED 참가자로 등록한다.
+    // 이미 참가자면 멱등(상태 그대로) — 어느 쪽이든 상세 응답을 반환한다.
+    @Transactional
+    public VoteRoomDetailResponse join(String code, Long memberId) {
+        VoteRoom room = voteRoomRepository.findByInviteCodeAndDeletedFalse(code)
+            .orElseThrow(() -> new EBException(ErrorCode.INVALID_INVITE_CODE));
+        if (room.isClosed()) {
+            throw new EBException(ErrorCode.VOTE_ROOM_CLOSED);
+        }
+
+        boolean alreadyParticipant = voteParticipantRepository
+            .existsByRoomIdAndMemberIdAndDeletedFalse(room.getId(), memberId);
+        if (!alreadyParticipant) {
+            voteParticipantRepository.save(VoteParticipant.joined(room.getId(), memberId));
+        }
+
+        return getDetail(room.getPublicId(), memberId);
     }
 
     @Transactional
@@ -102,7 +122,7 @@ public class VoteRoomService {
 
         List<VoteCandidate> candidates = voteCandidateRepository.findAllByRoomIdAndDeletedFalse(room.getId());
         List<VoteParticipant> participants = voteParticipantRepository.findAllByRoomIdAndDeletedFalse(room.getId());
-        Long myCandidateId = voteRoomCacheService.getMyChoice(publicId, room.getId(), memberId);
+        List<Long> myBallot = voteRoomCacheService.getMyBallot(publicId, room.getId(), memberId);
 
         return new VoteRoomDetailResponse(
             room.getPublicId(),
@@ -110,7 +130,9 @@ public class VoteRoomService {
             room.getHostMemberId(),
             room.getStatus().name(),
             room.getWinnerCandidateId(),
-            myCandidateId,
+            room.getInviteCode(),
+            room.isHost(memberId),
+            myBallot,
             candidates.stream().map(CandidateResponse::from).toList(),
             participants.stream().map(ParticipantResponse::from).toList());
     }
@@ -154,7 +176,9 @@ public class VoteRoomService {
                 snapshot.version(), snapshot.entries());
         }
 
-        TallySnapshot snapshot = voteRoomCacheService.getTally(publicId, room.getId());
+        // version을 증가시킨 스냅샷을 쓴다. 안 그러면 ROOM_CLOSED가 직전 TALLY_UPDATED와 같은 version을 실어
+        // 클라이언트의 단조증가 dedup에 폐기되고 참가자 화면이 CLOSED로 안 바뀐다.
+        TallySnapshot snapshot = voteRoomCacheService.bumpVersionAndGetTally(publicId, room.getId());
         room.close(decideWinner(snapshot.entries()));
 
         // 실제 OPEN -> CLOSED 전환 시에만 커밋 후 broadcast — 멱등 경로(위 early return)는 재push 금지.
@@ -164,10 +188,10 @@ public class VoteRoomService {
             snapshot.version(), snapshot.entries());
     }
 
-    // D2: 최다득표, 동점이면 최소 candidateId 승리 (완전 결정론)
+    // D2: 최고점, 동점이면 최소 candidateId 승리 (완전 결정론). score = 순위 ballot 점수합.
     private Long decideWinner(List<TallyEntry> tally) {
         return tally.stream()
-            .max(Comparator.comparing(TallyEntry::count)
+            .max(Comparator.comparing(TallyEntry::score)
                 .thenComparing(Comparator.comparing(TallyEntry::candidateId).reversed()))
             .map(TallyEntry::candidateId)
             .orElse(null);
@@ -186,5 +210,19 @@ public class VoteRoomService {
 
     private String generatePublicId() {
         return "VR_" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+    }
+
+    // 6자리 대문자+숫자. 혼동문자(0,O,1,I,L) 제외. 충돌(unique) 시 재생성.
+    private String generateInviteCode() {
+        String code;
+        do {
+            StringBuilder sb = new StringBuilder(INVITE_CODE_LENGTH);
+            for (int i = 0; i < INVITE_CODE_LENGTH; i++) {
+                sb.append(INVITE_CODE_ALPHABET.charAt(
+                    INVITE_CODE_RANDOM.nextInt(INVITE_CODE_ALPHABET.length())));
+            }
+            code = sb.toString();
+        } while (voteRoomRepository.findByInviteCodeAndDeletedFalse(code).isPresent());
+        return code;
     }
 }

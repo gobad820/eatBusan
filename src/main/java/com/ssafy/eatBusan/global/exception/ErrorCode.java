@@ -54,6 +54,10 @@ public enum ErrorCode {
     NOT_ROOM_PARTICIPANT(HttpStatus.FORBIDDEN, "투표방 참가자가 아닙니다."),
     NOT_ROOM_HOST(HttpStatus.FORBIDDEN, "투표방 호스트만 수행할 수 있습니다."),
     CANDIDATE_NOT_IN_ROOM(HttpStatus.BAD_REQUEST, "이 투표방의 후보가 아닙니다."),
+    INVALID_INVITE_CODE(HttpStatus.NOT_FOUND, "유효하지 않은 초대 코드입니다."),
+    BALLOT_EMPTY(HttpStatus.BAD_REQUEST, "후보를 1개 이상 선택해야 합니다."),
+    BALLOT_TOO_MANY(HttpStatus.BAD_REQUEST, "후보는 최대 3개까지 선택할 수 있습니다."),
+    BALLOT_DUPLICATE_CANDIDATE(HttpStatus.BAD_REQUEST, "같은 후보를 중복으로 선택할 수 없습니다."),
     WS_SEND_NOT_ALLOWED(HttpStatus.FORBIDDEN, "WebSocket으로는 메시지를 보낼 수 없습니다.");
 
     private final HttpStatus status;

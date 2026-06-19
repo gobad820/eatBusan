@@ -15,7 +15,12 @@ import lombok.NoArgsConstructor;
 @Entity
 @Table(
         name = "vote",
-        uniqueConstraints = @UniqueConstraint(columnNames = {"room_id", "member_id"})
+        uniqueConstraints = {
+                // 한 투표자는 방 안에서 각 순위(1~3)를 한 번씩만 사용한다.
+                @UniqueConstraint(columnNames = {"room_id", "member_id", "ballot_rank"}),
+                // 한 투표자는 방 안에서 같은 후보를 두 순위에 중복으로 넣을 수 없다.
+                @UniqueConstraint(columnNames = {"room_id", "member_id", "candidate_id"})
+        }
 )
 @Getter
 @NoArgsConstructor(access = AccessLevel.PROTECTED)
@@ -34,16 +39,24 @@ public class Vote extends BaseEntity {
     @Column(name = "member_id", nullable = false)
     private Long memberId;
 
-    public static Vote of(Long roomId, Long candidateId, Long memberId) {
+    // 순위: 1(1등)~3(3등). 점수는 pointsOf(rank)로 환산한다.
+    // 컬럼명은 ballot_rank — "rank"는 MySQL 8 예약어(RANK() 윈도우 함수)라 DDL이 깨진다.
+    @Column(name = "ballot_rank", nullable = false)
+    private int rank;
+
+    public static Vote of(Long roomId, Long candidateId, Long memberId, int rank) {
         Vote vote = new Vote();
         vote.roomId = roomId;
         vote.candidateId = candidateId;
         vote.memberId = memberId;
+        vote.rank = rank;
         return vote;
     }
 
-    // 1인 1표(unique room+member) — 표 변경은 insert가 아니라 기존 row의 candidate update다.
-    public void changeCandidate(Long candidateId) {
-        this.candidateId = candidateId;
+    // 순위→점수 매핑. rank1=5, rank2=3, rank3=1, 그 외 0.
+    // !! 동기화 필요 !! 이 매핑은 vote-cast.lua 와 동일하게 유지해야 한다.
+    //                  한쪽만 바꾸면 Redis 집계와 DB fallback 집계가 어긋난다.
+    public static int pointsOf(int rank) {
+        return rank == 1 ? 5 : rank == 2 ? 3 : rank == 3 ? 1 : 0;
     }
 }

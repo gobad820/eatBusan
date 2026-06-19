@@ -19,20 +19,21 @@ import com.ssafy.eatBusan.voteroom.dto.VoteRoomCreateRequest;
 import com.ssafy.eatBusan.voteroom.dto.VoteRoomCreateResponse;
 import com.ssafy.eatBusan.voteroom.dto.VoteRoomDetailResponse;
 import com.ssafy.eatBusan.voteroom.dto.VoteRoomResultResponse;
+import com.ssafy.eatBusan.voteroom.domain.VoteRoom;
+import com.ssafy.eatBusan.voteroom.repository.VoteCandidateRepository;
+import com.ssafy.eatBusan.voteroom.repository.VoteParticipantRepository;
 import com.ssafy.eatBusan.voteroom.repository.VoteRepository;
 import com.ssafy.eatBusan.voteroom.repository.VoteRoomRepository;
+import com.ssafy.eatBusan.voteroom.service.VoteRoomCleanupService;
 import com.ssafy.eatBusan.voteroom.service.VoteRoomService;
 import com.ssafy.eatBusan.voteroom.service.VoteService;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
@@ -43,11 +44,16 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 
 /**
- * 투표방 E2E 검증 (설계 §11.1 매트릭스).
+ * 투표방 순위투표 통합 검증.
  *
- * - DB: H2 (테스트 프로퍼티), Redis: 실제 localhost 인스턴스 (PostLike 패턴과 동일 전제)
- * - KakaoApiUtil만 가짜 응답으로 대체 — 방 생성 시 후보 시드 경로를 외부 의존 없이 재현한다.
- * - 각 케이스는 "응답 + DB + Redis" 삼중 검증과 불변(안 바뀌어야 할 집계) 검증을 함께 수행한다.
+ * <p>모델: 한 투표자가 후보 1~3개를 순서대로 선택(ballot). 점수 매핑 rank1=5, rank2=3, rank3=1.
+ * 집계(tally)는 후보별 점수 합, 승자는 최고점·동점 시 최소 candidateId.
+ *
+ * <ul>
+ *   <li>DB: H2 (테스트 프로퍼티), Redis: 실제 localhost 인스턴스 (PostLike 패턴 전제와 동일)
+ *   <li>KakaoApiUtil만 가짜 응답으로 대체 — 방 생성 시 후보 시드 경로를 외부 의존 없이 재현한다.
+ *   <li>각 케이스는 "응답 + DB + Redis" 검증과 불변(안 바뀌어야 할 집계) 검증을 함께 수행한다.
+ * </ul>
  */
 @SpringBootTest
 class VoteRoomIntegrationTest {
@@ -57,6 +63,11 @@ class VoteRoomIntegrationTest {
     private static final Long MEMBER_B = 9102L;
     private static final Long OUTSIDER = 9103L;
 
+    // 순위→점수 매핑(SSOT). vote-cast.lua / Vote.pointsOf 와 동일.
+    private static final long RANK1 = 5L;
+    private static final long RANK2 = 3L;
+    private static final long RANK3 = 1L;
+
     // 테스트 간 Place.code 충돌을 피하기 위한 전역 증가 카운터
     private static final AtomicLong PLACE_CODE_SEQ = new AtomicLong(910_000_000L);
 
@@ -65,9 +76,15 @@ class VoteRoomIntegrationTest {
     @Autowired
     private VoteService voteService;
     @Autowired
+    private VoteRoomCleanupService voteRoomCleanupService;
+    @Autowired
     private VoteRepository voteRepository;
     @Autowired
     private VoteRoomRepository voteRoomRepository;
+    @Autowired
+    private VoteCandidateRepository voteCandidateRepository;
+    @Autowired
+    private VoteParticipantRepository voteParticipantRepository;
     @Autowired
     private StringRedisTemplate redisTemplate;
 
@@ -91,7 +108,7 @@ class VoteRoomIntegrationTest {
     private VoteRoomCreateResponse createRoom() {
         given(kakaoApiUtil.searchPlaces(any())).willReturn(fakeKakaoResponse(5));
         VoteRoomCreateResponse room = voteRoomService.create(HOST, new VoteRoomCreateRequest(
-                "E2E 테스트 점심", 35.2322, 129.0838, 1000, List.of(MEMBER_A, MEMBER_B)));
+                "순위투표 테스트 점심", 35.2322, 129.0838, 1000));
         createdPublicIds.add(room.roomPublicId());
         return room;
     }
@@ -108,35 +125,41 @@ class VoteRoomIntegrationTest {
     }
 
     private Map<Long, Long> tallyMap(List<TallyEntry> tally) {
-        return tally.stream().collect(Collectors.toMap(TallyEntry::candidateId, TallyEntry::count));
+        return tally.stream().collect(Collectors.toMap(TallyEntry::candidateId, TallyEntry::score));
     }
 
-    private long totalVotes(List<TallyEntry> tally) {
-        return tally.stream().mapToLong(TallyEntry::count).sum();
+    private long totalScore(List<TallyEntry> tally) {
+        return tally.stream().mapToLong(TallyEntry::score).sum();
     }
 
     private Long roomId(String publicId) {
         return voteRoomRepository.findByPublicIdAndDeletedFalse(publicId).orElseThrow().getId();
     }
 
+    // 후보 candidateId 오름차순 정렬 — 동점 tie-break(최소 candidateId) 기대값 산출용.
+    private List<Long> sortedCandidateIds(VoteRoomCreateResponse room) {
+        return room.candidates().stream()
+                .map(CandidateResponse::candidateId)
+                .sorted()
+                .toList();
+    }
+
     @Test
-    @DisplayName("방 생성 — 후보 5개 시드, 호스트 JOINED, 초대자 INVITED, Redis tally 0표 시드")
-    void createRoom_seedsCandidatesAndParticipants() {
+    @DisplayName("방 생성 — inviteCode 발급, 후보 5개 시드, 호스트만 JOINED, Redis tally 0점 시드")
+    void createRoom_seedsCandidatesAndHostOnly() {
         VoteRoomCreateResponse room = createRoom();
 
         assertSoftly(softly -> {
             softly.assertThat(room.roomPublicId()).startsWith("VR_");
+            softly.assertThat(room.inviteCode()).matches("[A-Z2-9]{6}");
             softly.assertThat(room.candidates()).hasSize(5);
-            softly.assertThat(room.participants()).hasSize(3);
-            softly.assertThat(room.participants())
-                    .filteredOn(p -> p.memberId().equals(HOST))
-                    .allMatch(p -> p.status().equals("JOINED"));
-            softly.assertThat(room.participants())
-                    .filteredOn(p -> !p.memberId().equals(HOST))
-                    .allMatch(p -> p.status().equals("INVITED"));
+            // 호스트만 참가자(JOINED). 초대 멤버 사전 등록 없음.
+            softly.assertThat(room.participants()).hasSize(1);
+            softly.assertThat(room.participants().get(0).memberId()).isEqualTo(HOST);
+            softly.assertThat(room.participants().get(0).status()).isEqualTo("JOINED");
         });
 
-        // Redis: 0표 후보도 전부 tally에 존재해야 한다 (ZADD 0 시드)
+        // Redis: 0점 후보도 전부 tally에 존재해야 한다 (ZADD 0 시드)
         Set<String> members = redisTemplate.opsForZSet()
                 .range("voteroom:" + room.roomPublicId() + ":tally", 0, -1);
         assertThat(members).containsExactlyInAnyOrderElementsOf(
@@ -144,246 +167,315 @@ class VoteRoomIntegrationTest {
     }
 
     @Test
-    @DisplayName("첫 투표 — tally +1, Vote row 1개 생성, 0표 후보도 집계에 노출")
-    void firstVote_incrementsTallyAndInsertsRow() {
+    @DisplayName("코드 입장 — 올바른 코드로 join 시 참가자 추가(JOINED), 잘못된 코드는 404 거부")
+    void join_byInviteCode() {
         VoteRoomCreateResponse room = createRoom();
-        Long c1 = room.candidates().get(0).candidateId();
 
-        VoteResponse response = voteService.cast(room.roomPublicId(), MEMBER_A, c1);
+        VoteRoomDetailResponse joined = voteRoomService.join(room.inviteCode(), MEMBER_A);
+
+        assertSoftly(softly -> {
+            softly.assertThat(joined.roomPublicId()).isEqualTo(room.roomPublicId());
+            softly.assertThat(joined.participants()).hasSize(2);
+            softly.assertThat(joined.participants())
+                    .filteredOn(p -> p.memberId().equals(MEMBER_A))
+                    .allMatch(p -> p.status().equals("JOINED"));
+        });
+        // DB: 참가자 2명(HOST, MEMBER_A)
+        assertThat(voteParticipantRepository.findAllByRoomIdAndDeletedFalse(roomId(room.roomPublicId())))
+                .hasSize(2);
+
+        // 같은 멤버 재입장은 멱등 — 참가자 수 불변
+        voteRoomService.join(room.inviteCode(), MEMBER_A);
+        assertThat(voteParticipantRepository.findAllByRoomIdAndDeletedFalse(roomId(room.roomPublicId())))
+                .hasSize(2);
+
+        // 잘못된 코드 → 404
+        EBException e = assertThrows(EBException.class,
+                () -> voteRoomService.join("ZZZZZZ", MEMBER_B));
+        assertThat(e.getErrorCode()).isEqualTo(ErrorCode.INVALID_INVITE_CODE);
+    }
+
+    @Test
+    @DisplayName("순위투표 — ballot=[c1,c2,c3] → c1+5,c2+3,c3+1. 응답 myBallot/tally + DB votes 3행(rank 1/2/3)")
+    void rankedVote_assignsScoresAndInsertsThreeRows() {
+        VoteRoomCreateResponse room = createRoom();
+        List<Long> ids = sortedCandidateIds(room);
+        Long c1 = ids.get(0);
+        Long c2 = ids.get(1);
+        Long c3 = ids.get(2);
+
+        VoteResponse response = voteService.cast(room.roomPublicId(), HOST, List.of(c1, c2, c3));
 
         Map<Long, Long> tally = tallyMap(response.tally());
         assertSoftly(softly -> {
-            softly.assertThat(response.myCandidateId()).isEqualTo(c1);
-            softly.assertThat(tally.get(c1)).isEqualTo(1L);
-            softly.assertThat(response.tally()).hasSize(5); // 0표 후보 포함
-            softly.assertThat(totalVotes(response.tally())).isEqualTo(1L);
+            softly.assertThat(response.myBallot()).containsExactly(c1, c2, c3); // 순서 보존
+            softly.assertThat(tally.get(c1)).isEqualTo(RANK1);
+            softly.assertThat(tally.get(c2)).isEqualTo(RANK2);
+            softly.assertThat(tally.get(c3)).isEqualTo(RANK3);
+            softly.assertThat(response.tally()).hasSize(5);           // 0점 후보 포함
+            softly.assertThat(totalScore(response.tally())).isEqualTo(RANK1 + RANK2 + RANK3);
         });
 
-        // DB 검증: row 1개 생성
-        List<Vote> votes = voteRepository.findAllByRoomIdAndDeletedFalse(roomId(room.roomPublicId()));
-        assertThat(votes).hasSize(1);
-        assertThat(votes.get(0).getCandidateId()).isEqualTo(c1);
-        assertThat(votes.get(0).getMemberId()).isEqualTo(MEMBER_A);
+        // DB: rank 1/2/3 세 행
+        List<Vote> votes = voteRepository
+                .findAllByRoomIdAndMemberIdAndDeletedFalseOrderByRankAsc(roomId(room.roomPublicId()), HOST);
+        assertSoftly(softly -> {
+            softly.assertThat(votes).hasSize(3);
+            softly.assertThat(votes.get(0).getRank()).isEqualTo(1);
+            softly.assertThat(votes.get(0).getCandidateId()).isEqualTo(c1);
+            softly.assertThat(votes.get(1).getRank()).isEqualTo(2);
+            softly.assertThat(votes.get(1).getCandidateId()).isEqualTo(c2);
+            softly.assertThat(votes.get(2).getRank()).isEqualTo(3);
+            softly.assertThat(votes.get(2).getCandidateId()).isEqualTo(c3);
+        });
 
-        // Redis 검증: tally/choice 키 직접 확인
+        // Redis: tally ZSET score 직접 확인
         assertThat(redisTemplate.opsForZSet()
                 .score("voteroom:" + room.roomPublicId() + ":tally", String.valueOf(c1)))
-                .isEqualTo(1.0);
+                .isEqualTo((double) RANK1);
         assertThat(redisTemplate.opsForValue()
-                .get("voteroom:" + room.roomPublicId() + ":choice:" + MEMBER_A))
-                .isEqualTo(String.valueOf(c1));
+                .get("voteroom:" + room.roomPublicId() + ":ballot:" + HOST))
+                .isEqualTo(c1 + "," + c2 + "," + c3);
     }
 
     @Test
-    @DisplayName("표 변경(A→B) — A는 -1, B는 +1, Vote row는 update(총 row 수 불변), 총 표수 불변")
-    void changeVote_movesTallyAndUpdatesRow() {
+    @DisplayName("ballot 교체(재투표) — 이전 점수 차감 + 새 점수 가산, 동일 ballot 재제출은 멱등(version 불변)")
+    void changeBallot_recomputesScores_andSameBallotIsIdempotent() {
         VoteRoomCreateResponse room = createRoom();
-        Long c1 = room.candidates().get(0).candidateId();
-        Long c2 = room.candidates().get(1).candidateId();
+        List<Long> ids = sortedCandidateIds(room);
+        Long c1 = ids.get(0);
+        Long c2 = ids.get(1);
+        Long c3 = ids.get(2);
+        Long c4 = ids.get(3);
+        String verKey = "voteroom:" + room.roomPublicId() + ":ver";
 
-        voteService.cast(room.roomPublicId(), MEMBER_A, c1);
-        Long rowIdBefore = voteRepository
-                .findAllByRoomIdAndDeletedFalse(roomId(room.roomPublicId())).get(0).getId();
+        // 첫 ballot: [c1,c2,c3]
+        voteService.cast(room.roomPublicId(), HOST, List.of(c1, c2, c3));
 
-        VoteResponse response = voteService.cast(room.roomPublicId(), MEMBER_A, c2);
-
-        Map<Long, Long> tally = tallyMap(response.tally());
+        // 새 ballot: [c2,c4] → c2 rank1=5, c4 rank2=3. 이전 점수(c1=5,c2=3,c3=1) 전부 차감.
+        VoteResponse changed = voteService.cast(room.roomPublicId(), HOST, List.of(c2, c4));
+        Map<Long, Long> tally = tallyMap(changed.tally());
         assertSoftly(softly -> {
-            softly.assertThat(tally.get(c1)).isEqualTo(0L);
-            softly.assertThat(tally.get(c2)).isEqualTo(1L);
-            softly.assertThat(totalVotes(response.tally())).isEqualTo(1L); // 총 표수 불변
+            softly.assertThat(changed.myBallot()).containsExactly(c2, c4);
+            softly.assertThat(tally.get(c1)).isEqualTo(0L);     // 차감됨
+            softly.assertThat(tally.get(c2)).isEqualTo(RANK1);  // 3 → 0 → +5
+            softly.assertThat(tally.get(c3)).isEqualTo(0L);     // 차감됨
+            softly.assertThat(tally.get(c4)).isEqualTo(RANK2);
+            softly.assertThat(totalScore(changed.tally())).isEqualTo(RANK1 + RANK2);
         });
+        // DB: 교체 후 2행(이전 3행 물리 삭제됨)
+        assertThat(voteRepository
+                .findAllByRoomIdAndMemberIdAndDeletedFalseOrderByRankAsc(roomId(room.roomPublicId()), HOST))
+                .hasSize(2);
 
-        // DB: 새 row insert가 아니라 기존 row update여야 한다.
-        List<Vote> votes = voteRepository.findAllByRoomIdAndDeletedFalse(roomId(room.roomPublicId()));
-        assertThat(votes).hasSize(1);
-        assertThat(votes.get(0).getId()).isEqualTo(rowIdBefore);
-        assertThat(votes.get(0).getCandidateId()).isEqualTo(c2);
+        // 동일 ballot 재제출 → 멱등: tally 불변 + version 불변
+        long verBefore = Long.parseLong(redisTemplate.opsForValue().get(verKey));
+        VoteResponse same = voteService.cast(room.roomPublicId(), HOST, List.of(c2, c4));
+        long verAfter = Long.parseLong(redisTemplate.opsForValue().get(verKey));
+        assertSoftly(softly -> {
+            softly.assertThat(same.myBallot()).containsExactly(c2, c4);
+            softly.assertThat(tallyMap(same.tally())).isEqualTo(tally);
+            softly.assertThat(verAfter).isEqualTo(verBefore);  // 멱등이면 버전 단조 증가가 멈춘다
+        });
+        assertThat(voteRepository
+                .findAllByRoomIdAndMemberIdAndDeletedFalseOrderByRankAsc(roomId(room.roomPublicId()), HOST))
+                .hasSize(2);
     }
 
     @Test
-    @DisplayName("같은 후보 재클릭 — 멱등: 응답 200 동작이되 집계·DB·Redis 모두 불변")
-    void recastSameCandidate_isIdempotent() {
+    @DisplayName("승자 — 최고점 승리, 동점 시 최소 candidateId")
+    void winner_highestScoreThenSmallestId() {
+        // 1) 명확한 최고점 승자
         VoteRoomCreateResponse room = createRoom();
-        Long c1 = room.candidates().get(0).candidateId();
+        List<Long> ids = sortedCandidateIds(room);
+        // HOST: [c1] → c1+5. A: [c0] → c0+5 이지만 아래 구성으로 c0가 단독 최고가 되게 함.
+        voteRoomService.join(room.inviteCode(), MEMBER_A);
+        voteService.cast(room.roomPublicId(), HOST, List.of(ids.get(0), ids.get(1))); // c0=5, c1=3
+        voteService.cast(room.roomPublicId(), MEMBER_A, List.of(ids.get(0)));         // c0=10
+        VoteRoomResultResponse closed = voteRoomService.close(room.roomPublicId(), HOST);
+        assertThat(closed.winnerCandidateId()).isEqualTo(ids.get(0)); // 최고점 c0=10
 
-        VoteResponse first = voteService.cast(room.roomPublicId(), MEMBER_A, c1);
-        VoteResponse second = voteService.cast(room.roomPublicId(), MEMBER_A, c1);
-
-        assertThat(second.myCandidateId()).isEqualTo(c1);
-        assertThat(tallyMap(second.tally())).isEqualTo(tallyMap(first.tally())); // 집계 불변
-        assertThat(voteRepository.findAllByRoomIdAndDeletedFalse(roomId(room.roomPublicId())))
-                .hasSize(1);
+        // 2) 동점 → 최소 candidateId
+        VoteRoomCreateResponse tieRoom = createRoom();
+        List<Long> tieIds = sortedCandidateIds(tieRoom);
+        voteRoomService.join(tieRoom.inviteCode(), MEMBER_A);
+        // host=[c2](5), A=[c1](5) → c1,c2 동점 5점. 승자는 최소 candidateId c1.
+        voteService.cast(tieRoom.roomPublicId(), HOST, List.of(tieIds.get(2)));
+        voteService.cast(tieRoom.roomPublicId(), MEMBER_A, List.of(tieIds.get(1)));
+        VoteRoomResultResponse tieClosed = voteRoomService.close(tieRoom.roomPublicId(), HOST);
+        Long expectedTieWinner = tieIds.stream()
+                .filter(id -> id.equals(tieIds.get(1)) || id.equals(tieIds.get(2)))
+                .min(Comparator.naturalOrder()).orElseThrow();
+        assertThat(tieClosed.winnerCandidateId()).isEqualTo(expectedTieWinner);
     }
 
     @Test
-    @DisplayName("비참가자 투표 — 403(NOT_ROOM_PARTICIPANT), 집계 불변")
-    void nonParticipantVote_forbiddenAndNoSideEffect() {
+    @DisplayName("마감 — close 시 status CLOSED, winner 확정, closedAt 기록. 비호스트는 403")
+    void close_setsStatusWinnerAndClosedAt() {
         VoteRoomCreateResponse room = createRoom();
-        Long c1 = room.candidates().get(0).candidateId();
-        voteService.cast(room.roomPublicId(), MEMBER_A, c1);
-        List<TallyEntry> before = voteRoomService.getResult(room.roomPublicId(), MEMBER_A).tally();
+        List<Long> ids = sortedCandidateIds(room);
+        voteService.cast(room.roomPublicId(), HOST, List.of(ids.get(0)));
 
-        EBException e = assertThrows(EBException.class,
-                () -> voteService.cast(room.roomPublicId(), OUTSIDER, c1));
-
-        assertThat(e.getErrorCode()).isEqualTo(ErrorCode.NOT_ROOM_PARTICIPANT);
-        // 불변 검증: 집계·DB 모두 그대로
-        assertThat(tallyMap(voteRoomService.getResult(room.roomPublicId(), MEMBER_A).tally()))
-                .isEqualTo(tallyMap(before));
-        assertThat(voteRepository.findAllByRoomIdAndDeletedFalse(roomId(room.roomPublicId())))
-                .hasSize(1);
-    }
-
-    @Test
-    @DisplayName("다른 방 후보로 투표 — 400(CANDIDATE_NOT_IN_ROOM), 없는 방 — 404(VOTE_ROOM_NOT_FOUND)")
-    void invalidCandidateOrRoom_rejected() {
-        VoteRoomCreateResponse roomA = createRoom();
-        VoteRoomCreateResponse roomB = createRoom();
-        Long foreignCandidate = roomB.candidates().get(0).candidateId();
-
-        EBException wrongCandidate = assertThrows(EBException.class,
-                () -> voteService.cast(roomA.roomPublicId(), MEMBER_A, foreignCandidate));
-        assertThat(wrongCandidate.getErrorCode()).isEqualTo(ErrorCode.CANDIDATE_NOT_IN_ROOM);
-
-        EBException noRoom = assertThrows(EBException.class,
-                () -> voteService.cast("VR_nope9999", MEMBER_A, foreignCandidate));
-        assertThat(noRoom.getErrorCode()).isEqualTo(ErrorCode.VOTE_ROOM_NOT_FOUND);
-    }
-
-    @Test
-    @DisplayName("마감 — 비호스트 403, 호스트 마감 시 동점이면 최소 candidateId 승리(D2), 재호출 멱등")
-    void close_hostOnlyTieBreakAndIdempotent() {
-        VoteRoomCreateResponse room = createRoom();
-        List<CandidateResponse> candidates = room.candidates();
-        Long minOfTied = candidates.stream()
-                .map(CandidateResponse::candidateId)
-                .sorted()
-                .limit(3)
-                .min(Long::compareTo)
-                .orElseThrow();
-        List<Long> sorted = candidates.stream().map(CandidateResponse::candidateId).sorted().toList();
-        // 3파전 동점 구성: host/A/B가 각각 다른 후보에 1표
-        voteService.cast(room.roomPublicId(), HOST, sorted.get(0));
-        voteService.cast(room.roomPublicId(), MEMBER_A, sorted.get(1));
-        voteService.cast(room.roomPublicId(), MEMBER_B, sorted.get(2));
+        // 마감 직전 version 스냅샷(vPre). close가 version을 증가시켜야 참가자 화면 dedup이 통과한다.
+        long vPre = voteRoomService.getResult(room.roomPublicId(), HOST).version();
 
         // 비호스트 마감 → 403, 상태 불변
         EBException notHost = assertThrows(EBException.class,
                 () -> voteRoomService.close(room.roomPublicId(), MEMBER_A));
         assertThat(notHost.getErrorCode()).isEqualTo(ErrorCode.NOT_ROOM_HOST);
-        assertThat(voteRoomService.getResult(room.roomPublicId(), MEMBER_A).status())
-                .isEqualTo("OPEN");
 
-        // 호스트 마감 → CLOSED + 동점 시 최소 candidateId 승리
         VoteRoomResultResponse closed = voteRoomService.close(room.roomPublicId(), HOST);
         assertSoftly(softly -> {
             softly.assertThat(closed.status()).isEqualTo("CLOSED");
-            softly.assertThat(closed.winnerCandidateId()).isEqualTo(minOfTied);
+            softly.assertThat(closed.winnerCandidateId()).isEqualTo(ids.get(0));
+            // close는 version을 엄격히 증가시킨다(vClose > vPre). 같으면 ROOM_CLOSED 스냅샷이 폐기되는 버그.
+            softly.assertThat(closed.version()).isGreaterThan(vPre);
+        });
+        // DB: status CLOSED + closedAt 기록
+        VoteRoom persisted = voteRoomRepository.findByPublicIdAndDeletedFalse(room.roomPublicId())
+                .orElseThrow();
+        assertSoftly(softly -> {
+            softly.assertThat(persisted.isClosed()).isTrue();
+            softly.assertThat(persisted.getWinnerCandidateId()).isEqualTo(ids.get(0));
+            softly.assertThat(persisted.getClosedAt()).isNotNull();
         });
 
-        // 재호출 멱등: 같은 winner, 집계 불변
+        // 재마감 멱등
         VoteRoomResultResponse again = voteRoomService.close(room.roomPublicId(), HOST);
-        assertThat(again.status()).isEqualTo("CLOSED");
         assertThat(again.winnerCandidateId()).isEqualTo(closed.winnerCandidateId());
-        assertThat(tallyMap(again.tally())).isEqualTo(tallyMap(closed.tally()));
+    }
+
+    @Test
+    @DisplayName("단발성 삭제 — 마감 경과 방 hard delete 시 room/vote/candidate/participant 물리 삭제, 이후 조회 404")
+    void cleanup_hardDeletesClosedRoom() {
+        VoteRoomCreateResponse room = createRoom();
+        Long internalId = roomId(room.roomPublicId());
+        List<Long> ids = sortedCandidateIds(room);
+        voteService.cast(room.roomPublicId(), HOST, List.of(ids.get(0), ids.get(1)));
+        voteRoomService.close(room.roomPublicId(), HOST);
+
+        // BEFORE: 모든 연관 엔티티가 존재한다.
+        assertSoftly(softly -> {
+            softly.assertThat(voteRoomRepository.findById(internalId)).isPresent();
+            softly.assertThat(voteRepository.findAllByRoomIdAndDeletedFalse(internalId)).isNotEmpty();
+            softly.assertThat(voteCandidateRepository.findAllByRoomIdAndDeletedFalse(internalId)).hasSize(5);
+            softly.assertThat(voteParticipantRepository.findAllByRoomIdAndDeletedFalse(internalId)).isNotEmpty();
+        });
+
+        // delete-delay 경과를 시뮬레이션: 미래 시각을 threshold로 줘 closedAt(now)을 만료로 본다.
+        List<VoteRoom> expired = voteRoomCleanupService.findExpiredRooms(LocalDateTime.now().plusMinutes(1));
+        assertThat(expired).extracting(VoteRoom::getId).contains(internalId);
+        VoteRoom target = expired.stream().filter(r -> r.getId().equals(internalId)).findFirst().orElseThrow();
+        voteRoomCleanupService.cleanup(target);
+
+        // AFTER: room/vote/candidate/participant 물리 삭제
+        assertSoftly(softly -> {
+            softly.assertThat(voteRoomRepository.findById(internalId)).isEmpty();
+            softly.assertThat(voteRepository.findAllByRoomIdAndDeletedFalse(internalId)).isEmpty();
+            softly.assertThat(voteCandidateRepository.findAllByRoomIdAndDeletedFalse(internalId)).isEmpty();
+            softly.assertThat(voteParticipantRepository.findAllByRoomIdAndDeletedFalse(internalId)).isEmpty();
+        });
+        // 조회 404 (Redis 키 흔적은 남기지 않음 — cleanup이 purge)
+        EBException e = assertThrows(EBException.class,
+                () -> voteRoomService.getDetail(room.roomPublicId(), HOST));
+        assertThat(e.getErrorCode()).isEqualTo(ErrorCode.VOTE_ROOM_NOT_FOUND);
+    }
+
+    @Test
+    @DisplayName("인가 — 비참가자 투표/조회 거부(403), 집계 불변")
+    void nonParticipant_voteAndReadForbidden() {
+        VoteRoomCreateResponse room = createRoom();
+        List<Long> ids = sortedCandidateIds(room);
+        voteService.cast(room.roomPublicId(), HOST, List.of(ids.get(0)));
+        List<TallyEntry> before = voteRoomService.getResult(room.roomPublicId(), HOST).tally();
+
+        EBException voteDenied = assertThrows(EBException.class,
+                () -> voteService.cast(room.roomPublicId(), OUTSIDER, List.of(ids.get(0))));
+        assertThat(voteDenied.getErrorCode()).isEqualTo(ErrorCode.NOT_ROOM_PARTICIPANT);
+
+        EBException readDenied = assertThrows(EBException.class,
+                () -> voteRoomService.getResult(room.roomPublicId(), OUTSIDER));
+        assertThat(readDenied.getErrorCode()).isEqualTo(ErrorCode.NOT_ROOM_PARTICIPANT);
+
+        // 불변: 집계·DB 그대로
+        assertThat(tallyMap(voteRoomService.getResult(room.roomPublicId(), HOST).tally()))
+                .isEqualTo(tallyMap(before));
+        assertThat(voteRepository.findAllByRoomIdAndDeletedFalse(roomId(room.roomPublicId())))
+                .hasSize(1);
+    }
+
+    @Test
+    @DisplayName("거부 케이스 — 다른 방 후보(400), 없는 방(404), 빈/중복/초과 ballot(400)")
+    void invalidVotes_rejected() {
+        VoteRoomCreateResponse roomA = createRoom();
+        VoteRoomCreateResponse roomB = createRoom();
+        Long foreignCandidate = roomB.candidates().get(0).candidateId();
+
+        EBException wrongCandidate = assertThrows(EBException.class,
+                () -> voteService.cast(roomA.roomPublicId(), HOST, List.of(foreignCandidate)));
+        assertThat(wrongCandidate.getErrorCode()).isEqualTo(ErrorCode.CANDIDATE_NOT_IN_ROOM);
+
+        EBException noRoom = assertThrows(EBException.class,
+                () -> voteService.cast("VR_nope9999", HOST, List.of(foreignCandidate)));
+        assertThat(noRoom.getErrorCode()).isEqualTo(ErrorCode.VOTE_ROOM_NOT_FOUND);
+
+        List<Long> ids = sortedCandidateIds(roomA);
+        EBException empty = assertThrows(EBException.class,
+                () -> voteService.cast(roomA.roomPublicId(), HOST, List.of()));
+        assertThat(empty.getErrorCode()).isEqualTo(ErrorCode.BALLOT_EMPTY);
+
+        EBException dup = assertThrows(EBException.class,
+                () -> voteService.cast(roomA.roomPublicId(), HOST, List.of(ids.get(0), ids.get(0))));
+        assertThat(dup.getErrorCode()).isEqualTo(ErrorCode.BALLOT_DUPLICATE_CANDIDATE);
+
+        EBException tooMany = assertThrows(EBException.class,
+                () -> voteService.cast(roomA.roomPublicId(), HOST,
+                        List.of(ids.get(0), ids.get(1), ids.get(2), ids.get(3))));
+        assertThat(tooMany.getErrorCode()).isEqualTo(ErrorCode.BALLOT_TOO_MANY);
     }
 
     @Test
     @DisplayName("CLOSED 방 투표 — 409(VOTE_ROOM_CLOSED), 집계·DB 불변")
-    void voteOnClosedRoom_conflictAndNoSideEffect() {
+    void voteOnClosedRoom_conflict() {
         VoteRoomCreateResponse room = createRoom();
-        Long c1 = room.candidates().get(0).candidateId();
-        Long c2 = room.candidates().get(1).candidateId();
-        voteService.cast(room.roomPublicId(), MEMBER_A, c1);
+        List<Long> ids = sortedCandidateIds(room);
+        voteService.cast(room.roomPublicId(), HOST, List.of(ids.get(0)));
         voteRoomService.close(room.roomPublicId(), HOST);
-        List<TallyEntry> before = voteRoomService.getResult(room.roomPublicId(), MEMBER_A).tally();
+        List<TallyEntry> before = voteRoomService.getResult(room.roomPublicId(), HOST).tally();
 
         EBException e = assertThrows(EBException.class,
-                () -> voteService.cast(room.roomPublicId(), MEMBER_A, c2));
-
+                () -> voteService.cast(room.roomPublicId(), HOST, List.of(ids.get(1))));
         assertThat(e.getErrorCode()).isEqualTo(ErrorCode.VOTE_ROOM_CLOSED);
-        assertThat(tallyMap(voteRoomService.getResult(room.roomPublicId(), MEMBER_A).tally()))
+
+        assertThat(tallyMap(voteRoomService.getResult(room.roomPublicId(), HOST).tally()))
                 .isEqualTo(tallyMap(before));
-        assertThat(voteRepository.findAllByRoomIdAndDeletedFalse(roomId(room.roomPublicId()))
-                .get(0).getCandidateId()).isEqualTo(c1);
+        assertThat(voteRepository
+                .findAllByRoomIdAndMemberIdAndDeletedFalseOrderByRankAsc(roomId(room.roomPublicId()), HOST)
+                .get(0).getCandidateId()).isEqualTo(ids.get(0));
     }
 
     @Test
-    @DisplayName("Redis 유실 후 조회 — ensureBootstrap이 DB 기준으로 tally/choice를 복원")
+    @DisplayName("Redis 유실 후 조회 — bootstrap이 DB 기준으로 tally/ballot 복원")
     void bootstrap_rebuildsFromDbAfterRedisLoss() {
         VoteRoomCreateResponse room = createRoom();
-        Long c1 = room.candidates().get(0).candidateId();
-        Long c2 = room.candidates().get(1).candidateId();
-        voteService.cast(room.roomPublicId(), HOST, c1);
-        voteService.cast(room.roomPublicId(), MEMBER_A, c2);
-        voteService.cast(room.roomPublicId(), MEMBER_B, c2);
+        List<Long> ids = sortedCandidateIds(room);
+        voteRoomService.join(room.inviteCode(), MEMBER_A);
+        voteService.cast(room.roomPublicId(), HOST, List.of(ids.get(0), ids.get(1)));    // c0=5, c1=3
+        voteService.cast(room.roomPublicId(), MEMBER_A, List.of(ids.get(1)));            // c1+=5 → c1=8
 
         // Redis 키 전체 유실 시뮬레이션
         Set<String> keys = redisTemplate.keys("voteroom:" + room.roomPublicId() + ":*");
         redisTemplate.delete(keys);
 
-        VoteRoomResultResponse result = voteRoomService.getResult(room.roomPublicId(), MEMBER_A);
-
+        VoteRoomResultResponse result = voteRoomService.getResult(room.roomPublicId(), HOST);
         Map<Long, Long> tally = tallyMap(result.tally());
         assertSoftly(softly -> {
-            softly.assertThat(tally.get(c1)).isEqualTo(1L);
-            softly.assertThat(tally.get(c2)).isEqualTo(2L);
-            softly.assertThat(result.tally()).hasSize(5); // 0표 후보 포함 복원
+            softly.assertThat(tally.get(ids.get(0))).isEqualTo(RANK1);          // c0=5
+            softly.assertThat(tally.get(ids.get(1))).isEqualTo(RANK2 + RANK1);  // c1=8
+            softly.assertThat(result.tally()).hasSize(5);
         });
-        // choice 키도 복원되어 내 표 조회가 가능해야 한다.
-        VoteRoomDetailResponse detail = voteRoomService.getDetail(room.roomPublicId(), MEMBER_A);
-        assertThat(detail.myCandidateId()).isEqualTo(c2);
-    }
-
-    @Test
-    @DisplayName("동시 투표 2건 — 서로 다른 참가자가 동시에 투표해도 총 표수·집계가 정확")
-    void concurrentVotes_keepTallyConsistent() throws InterruptedException {
-        VoteRoomCreateResponse room = createRoom();
-        Long c1 = room.candidates().get(0).candidateId();
-        Long c2 = room.candidates().get(1).candidateId();
-
-        ExecutorService executor = Executors.newFixedThreadPool(2);
-        CountDownLatch ready = new CountDownLatch(2);
-        CountDownLatch start = new CountDownLatch(1);
-        CountDownLatch done = new CountDownLatch(2);
-        List<Throwable> failures = new ArrayList<>();
-
-        for (Map.Entry<Long, Long> voterAndChoice
-                : Map.of(MEMBER_A, c1, MEMBER_B, c2).entrySet()) {
-            executor.submit(() -> {
-                ready.countDown();
-                try {
-                    start.await();
-                    voteService.cast(room.roomPublicId(),
-                            voterAndChoice.getKey(), voterAndChoice.getValue());
-                } catch (Throwable t) {
-                    synchronized (failures) {
-                        failures.add(t);
-                    }
-                } finally {
-                    done.countDown();
-                }
-            });
-        }
-        ready.await();
-        start.countDown();
-        assertThat(done.await(10, TimeUnit.SECONDS)).isTrue();
-        executor.shutdown();
-
-        assertThat(failures).isEmpty();
-        List<TallyEntry> tally = voteRoomService.getResult(room.roomPublicId(), HOST).tally();
-        Map<Long, Long> tallyByCandidate = tallyMap(tally);
-        assertSoftly(softly -> {
-            softly.assertThat(totalVotes(tally)).isEqualTo(2L);
-            softly.assertThat(tallyByCandidate.get(c1)).isEqualTo(1L);
-            softly.assertThat(tallyByCandidate.get(c2)).isEqualTo(1L);
-        });
-
-        // DB도 동일해야 한다 (Redis-DB 정합)
-        Map<Long, Long> dbVotes = voteRepository
-                .findAllByRoomIdAndDeletedFalse(roomId(room.roomPublicId())).stream()
-                .collect(Collectors.toMap(Vote::getMemberId, Vote::getCandidateId));
-        assertThat(dbVotes).isEqualTo(Map.of(MEMBER_A, c1, MEMBER_B, c2));
+        // ballot 키도 복원되어 myBallot 조회가 가능해야 한다.
+        VoteRoomDetailResponse detail = voteRoomService.getDetail(room.roomPublicId(), HOST);
+        assertThat(detail.myBallot()).containsExactly(ids.get(0), ids.get(1));
     }
 }
