@@ -77,7 +77,8 @@ public class VoteService {
         // sync/compensate/broadcast를 모두 생략하고 현재 집계만 돌려준다.
         if (!result.changed()) {
             TallySnapshot snapshot = voteRoomCacheService.getTally(publicId, room.getId());
-            return new VoteResponse(candidateIds, snapshot.entries());
+            long votedCount = voteRepository.countDistinctVotersByRoomId(room.getId());
+            return new VoteResponse(candidateIds, snapshot.entries(), votedCount);
         }
 
         // Redis는 이미 바뀐 상태이므로, DB 동기화 실패 시 Redis를 되돌린 뒤 예외를 다시 던진다.
@@ -99,11 +100,13 @@ public class VoteService {
         }
 
         TallySnapshot snapshot = voteRoomCacheService.getTally(publicId, room.getId());
+        // votedCount는 DB count — syncToDb(insert+flush) 이후에 계산한다.
+        long votedCount = voteRepository.countDistinctVotersByRoomId(room.getId());
 
         // 집계가 실제로 바뀐 경우(여기까지 온 경로)만 커밋 후 broadcast를 예약한다.
-        voteRoomBroadcaster.broadcastTallyUpdated(publicId, snapshot);
+        voteRoomBroadcaster.broadcastTallyUpdated(publicId, snapshot, votedCount);
 
-        return new VoteResponse(candidateIds, snapshot.entries());
+        return new VoteResponse(candidateIds, snapshot.entries(), votedCount);
     }
 
     private void validateBallot(List<Long> candidateIds) {
@@ -145,12 +148,14 @@ public class VoteService {
 
         syncToDb(room.getId(), memberId, candidateIds);
         List<TallyEntry> tally = voteRoomCacheService.tallyFromDb(room.getId());
+        // votedCount는 DB count — syncToDb 이후에 계산한다.
+        long votedCount = voteRepository.countDistinctVotersByRoomId(room.getId());
 
         // fallback 경로도 DB 상태는 바뀌었으므로 커밋 후 broadcast한다. 버전은 미상(UNVERSIONED).
         // (같은 ballot 재제출 판별이 없어 드물게 불변 push가 갈 수 있으나, 화면은 같은 집계로 갱신될 뿐이다.)
         voteRoomBroadcaster.broadcastTallyUpdated(room.getPublicId(),
-            new TallySnapshot(VoteRoomCacheService.UNVERSIONED, tally));
+            new TallySnapshot(VoteRoomCacheService.UNVERSIONED, tally), votedCount);
 
-        return new VoteResponse(candidateIds, tally);
+        return new VoteResponse(candidateIds, tally, votedCount);
     }
 }

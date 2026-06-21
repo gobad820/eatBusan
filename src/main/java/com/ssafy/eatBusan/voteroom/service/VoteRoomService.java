@@ -17,6 +17,7 @@ import com.ssafy.eatBusan.voteroom.dto.VoteRoomDetailResponse;
 import com.ssafy.eatBusan.voteroom.dto.VoteRoomResultResponse;
 import com.ssafy.eatBusan.voteroom.repository.VoteCandidateRepository;
 import com.ssafy.eatBusan.voteroom.repository.VoteParticipantRepository;
+import com.ssafy.eatBusan.voteroom.repository.VoteRepository;
 import com.ssafy.eatBusan.voteroom.repository.VoteRoomRepository;
 import com.ssafy.eatBusan.voteroom.service.VoteRoomCacheService.TallySnapshot;
 import java.security.SecureRandom;
@@ -46,6 +47,7 @@ public class VoteRoomService {
     private final VoteRoomRepository voteRoomRepository;
     private final VoteParticipantRepository voteParticipantRepository;
     private final VoteCandidateRepository voteCandidateRepository;
+    private final VoteRepository voteRepository;
     private final VoteRoomCacheService voteRoomCacheService;
     private final VoteRoomBroadcaster voteRoomBroadcaster;
     private final PlaceService placeService;
@@ -143,8 +145,9 @@ public class VoteRoomService {
         validateParticipant(room.getId(), memberId);
 
         TallySnapshot snapshot = voteRoomCacheService.getTally(publicId, room.getId());
+        long votedCount = voteRepository.countDistinctVotersByRoomId(room.getId());
         return new VoteRoomResultResponse(room.getStatus().name(), room.getWinnerCandidateId(),
-            snapshot.version(), snapshot.entries());
+            snapshot.version(), snapshot.entries(), votedCount);
     }
 
     // STOMP SUBSCRIBE 시점의 인가 + 입장 처리 (설계 §4.2: 방 입장/구독 = JOINED 전환 트리거).
@@ -172,20 +175,22 @@ public class VoteRoomService {
         // 멱등: 이미 CLOSED면 기존 winner 그대로 반환 (재계산·재push 없음)
         if (room.isClosed()) {
             TallySnapshot snapshot = voteRoomCacheService.getTally(publicId, room.getId());
+            long votedCount = voteRepository.countDistinctVotersByRoomId(room.getId());
             return new VoteRoomResultResponse(room.getStatus().name(), room.getWinnerCandidateId(),
-                snapshot.version(), snapshot.entries());
+                snapshot.version(), snapshot.entries(), votedCount);
         }
 
         // version을 증가시킨 스냅샷을 쓴다. 안 그러면 ROOM_CLOSED가 직전 TALLY_UPDATED와 같은 version을 실어
         // 클라이언트의 단조증가 dedup에 폐기되고 참가자 화면이 CLOSED로 안 바뀐다.
         TallySnapshot snapshot = voteRoomCacheService.bumpVersionAndGetTally(publicId, room.getId());
         room.close(decideWinner(snapshot.entries()));
+        long votedCount = voteRepository.countDistinctVotersByRoomId(room.getId());
 
         // 실제 OPEN -> CLOSED 전환 시에만 커밋 후 broadcast — 멱등 경로(위 early return)는 재push 금지.
-        voteRoomBroadcaster.broadcastRoomClosed(publicId, room.getWinnerCandidateId(), snapshot);
+        voteRoomBroadcaster.broadcastRoomClosed(publicId, room.getWinnerCandidateId(), snapshot, votedCount);
 
         return new VoteRoomResultResponse(room.getStatus().name(), room.getWinnerCandidateId(),
-            snapshot.version(), snapshot.entries());
+            snapshot.version(), snapshot.entries(), votedCount);
     }
 
     // D2: 최고점, 동점이면 최소 candidateId 승리 (완전 결정론). score = 순위 ballot 점수합.

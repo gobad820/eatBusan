@@ -30,13 +30,13 @@ public class VoteRoomBroadcaster {
     // 투표/표 변경 성공 시 — 집계 broadcast.
     // 트랜잭션 간 커밋(=전송) 순서는 스냅샷을 읽은 순서와 다를 수 있으므로,
     // 페이로드에 방별 단조 증가 version을 실어 클라이언트가 역행(stale) 스냅샷을 버리게 한다.
-    public void broadcastTallyUpdated(String publicId, TallySnapshot snapshot) {
-        sendAfterCommit(publicId, TallyUpdatedMessage.of(snapshot.version(), snapshot.entries()));
+    public void broadcastTallyUpdated(String publicId, TallySnapshot snapshot, long votedCount) {
+        sendAfterCommit(publicId, TallyUpdatedMessage.of(snapshot.version(), snapshot.entries(), votedCount));
     }
 
     // 마감 시 — 승자 + 최종 집계 broadcast (멱등 경로에서는 호출하지 말 것)
-    public void broadcastRoomClosed(String publicId, Long winnerCandidateId, TallySnapshot snapshot) {
-        sendAfterCommit(publicId, RoomClosedMessage.of(winnerCandidateId, snapshot.version(), snapshot.entries()));
+    public void broadcastRoomClosed(String publicId, Long winnerCandidateId, TallySnapshot snapshot, long votedCount) {
+        sendAfterCommit(publicId, RoomClosedMessage.of(winnerCandidateId, snapshot.version(), snapshot.entries(), votedCount));
     }
 
     private void sendAfterCommit(String publicId, Object payload) {

@@ -9,6 +9,7 @@ public record VoteRoomResultResponse(
         String status,
         Long winnerCandidateId,
         long version,
-        List<TallyEntry> tally
+        List<TallyEntry> tally,
+        long votedCount
 ) {
 }

@@ -214,6 +214,7 @@ class VoteRoomIntegrationTest {
             softly.assertThat(tally.get(c3)).isEqualTo(RANK3);
             softly.assertThat(response.tally()).hasSize(5);           // 0점 후보 포함
             softly.assertThat(totalScore(response.tally())).isEqualTo(RANK1 + RANK2 + RANK3);
+            softly.assertThat(response.votedCount()).isEqualTo(1L);   // 투표 완료 1명(HOST)
         });
 
         // DB: rank 1/2/3 세 행
@@ -262,6 +263,8 @@ class VoteRoomIntegrationTest {
             softly.assertThat(tally.get(c3)).isEqualTo(0L);     // 차감됨
             softly.assertThat(tally.get(c4)).isEqualTo(RANK2);
             softly.assertThat(totalScore(changed.tally())).isEqualTo(RANK1 + RANK2);
+            // ballot 교체(재투표)해도 distinct 투표자 수는 불변 — 여전히 1명(HOST).
+            softly.assertThat(changed.votedCount()).isEqualTo(1L);
         });
         // DB: 교체 후 2행(이전 3행 물리 삭제됨)
         assertThat(voteRepository
@@ -276,6 +279,7 @@ class VoteRoomIntegrationTest {
             softly.assertThat(same.myBallot()).containsExactly(c2, c4);
             softly.assertThat(tallyMap(same.tally())).isEqualTo(tally);
             softly.assertThat(verAfter).isEqualTo(verBefore);  // 멱등이면 버전 단조 증가가 멈춘다
+            softly.assertThat(same.votedCount()).isEqualTo(1L); // 동일 ballot 재제출도 1명 불변
         });
         assertThat(voteRepository
                 .findAllByRoomIdAndMemberIdAndDeletedFalseOrderByRankAsc(roomId(room.roomPublicId()), HOST))
@@ -294,6 +298,8 @@ class VoteRoomIntegrationTest {
         voteService.cast(room.roomPublicId(), MEMBER_A, List.of(ids.get(0)));         // c0=10
         VoteRoomResultResponse closed = voteRoomService.close(room.roomPublicId(), HOST);
         assertThat(closed.winnerCandidateId()).isEqualTo(ids.get(0)); // 최고점 c0=10
+        // 서로 다른 2명(HOST, MEMBER_A)이 투표 완료 → close 응답 votedCount==2
+        assertThat(closed.votedCount()).isEqualTo(2L);
 
         // 2) 동점 → 최소 candidateId
         VoteRoomCreateResponse tieRoom = createRoom();
@@ -473,9 +479,38 @@ class VoteRoomIntegrationTest {
             softly.assertThat(tally.get(ids.get(0))).isEqualTo(RANK1);          // c0=5
             softly.assertThat(tally.get(ids.get(1))).isEqualTo(RANK2 + RANK1);  // c1=8
             softly.assertThat(result.tally()).hasSize(5);
+            // getResult 응답 votedCount = distinct 투표자 2명(HOST, MEMBER_A)
+            softly.assertThat(result.votedCount()).isEqualTo(2L);
         });
         // ballot 키도 복원되어 myBallot 조회가 가능해야 한다.
         VoteRoomDetailResponse detail = voteRoomService.getDetail(room.roomPublicId(), HOST);
         assertThat(detail.myBallot()).containsExactly(ids.get(0), ids.get(1));
+    }
+
+    @Test
+    @DisplayName("votedCount — 투표 0건이면 0, 서로 다른 3명 투표 후 cast/getResult/close 모두 3")
+    void votedCount_zeroWhenNoVotes_andDistinctVoterCount() {
+        VoteRoomCreateResponse room = createRoom();
+        List<Long> ids = sortedCandidateIds(room);
+        voteRoomService.join(room.inviteCode(), MEMBER_A);
+        voteRoomService.join(room.inviteCode(), MEMBER_B);
+
+        // 투표 0건 → getResult votedCount == 0
+        assertThat(voteRoomService.getResult(room.roomPublicId(), HOST).votedCount()).isEqualTo(0L);
+
+        // 서로 다른 3명이 순차 투표 — cast 응답 votedCount가 누적 distinct 인원수와 같다.
+        VoteResponse castHost = voteService.cast(room.roomPublicId(), HOST, List.of(ids.get(0)));
+        assertThat(castHost.votedCount()).isEqualTo(1L);
+        VoteResponse castA = voteService.cast(room.roomPublicId(), MEMBER_A, List.of(ids.get(1)));
+        assertThat(castA.votedCount()).isEqualTo(2L);
+        VoteResponse castB = voteService.cast(room.roomPublicId(), MEMBER_B, List.of(ids.get(2)));
+        assertThat(castB.votedCount()).isEqualTo(3L);
+
+        // getResult도 distinct 3명
+        assertThat(voteRoomService.getResult(room.roomPublicId(), HOST).votedCount()).isEqualTo(3L);
+
+        // close 응답에도 votedCount 포함되고 distinct 3명과 같다.
+        VoteRoomResultResponse closed = voteRoomService.close(room.roomPublicId(), HOST);
+        assertThat(closed.votedCount()).isEqualTo(3L);
     }
 }
